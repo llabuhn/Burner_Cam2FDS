@@ -173,8 +173,11 @@ if __name__ == '__main__':
     Rf_s = .3  #Radioactive fraction of smoldering
     l = 1
     
-    knpdir='/data/paugam/Data/2014_SouthAfrica/'
+    knpdir='/mnt/dataEstrella1/2014_SouthAfrica/'
     maps_fire = np.load(knpdir+'4ForeFire/Skukuza4/skukuza4_4ForeFire.npy')
+    
+    inputDirSimu = '/data/paugam/FDS/BurnerSku4/'
+    fileConfigIn = inputDirSimu+'input_fixed_burner.fds_original'
     
     #divide resolution by 2, dx=2m
     nn = int(maps_fire.shape[0]/2)
@@ -210,8 +213,6 @@ if __name__ == '__main__':
     subset = maps2
     subset_size = subset.shape[0]
 
-    inputDirSimu = '/data/paugam/FDS/BurnerSku4/'
-    fileConfigIn = inputDirSimu+'input_fixed_burner.fds'
 
     nml = f90nml.read(fileConfigIn)
     surf_templates_original = nml['surf']
@@ -279,7 +280,7 @@ if __name__ == '__main__':
     del nml['VENT'][0]
 
     f90nml.write(nml, 'tmp.fds')
-    capitalize_ampersand_strings('tmp.fds', inputDir+os.path.basename(fileConfigIn).split('.')[0]+'_withBurner.fds')    
+    capitalize_ampersand_strings('tmp.fds', inputDirSimu+os.path.basename(fileConfigIn).split('.')[0]+'_withBurner.fds')    
     os.remove('tmp.fds')
 
     hrr_act_pix, total_HRR = sum_HRR_per_pixel(burner)
