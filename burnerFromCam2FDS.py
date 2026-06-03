@@ -1,288 +1,264 @@
-import numpy as np 
-import matplotlib
-import matplotlib.pyplot as plt
-import scipy.ndimage
-import f90nml
-import sys, os
+"""
+Converts a fire map (structured .npy) containing per-pixel fire radiative
+energy (FRE) with distinct flaming and residual smouldering contributions into a 
+Fire Dynamics Simulator (FDS) input file, in which every active fire pixel 
+is represented as a 'burner cell' (SURF/VENT pair with time-dependent RAMPs).
+"""
+
+import os
+import re 
 import copy
-import pandas as pd
-from scipy import integrate
-from numpy import trapz
+import warnings
+import numpy as np
 import multiprocessing as mp
-import pdb 
-import downgradeReso
+import f90nml
+import downgradereso as downgradeReso
+import geometry_utils
 
-###########################################
-class Burner:
-    def __init__(self, nml):
-        self.surf_template = nml['SURF'][0]
-        self.ramp_template = nml['ramp']
-        self.vent_template = nml['vent'][0]
+from pathlib import Path
+from datetime import datetime
 
-    def copy(self):
-        return copy.deepcopy(self)
+# ================= CONFIGURATION =================
+CASE_NAME = 'burner'                    # FDS case ID (CHID); names the output .fds and all FDS result files
+INPUT_NPY = 'skukuza4_4ForeFire.npy'    # ForeFire fire map (structured .npy) to convert
+TEMPLATE_FDS = 'burner_template.fds'    # FDS template with the base namelists and BURNER_template marker
 
+TARGET_SCALE = 2            # Defines resolution downgrade in downgradereso
+RAMP_UP = 0.5               # Ramp up time of 0.5 s before arrivalTime
+RAMP_DOWN = 0.1             # Ramp down time of 0.1 s after residenceTime and burningTime
+RF_F = 0.14                 # (Apparent) Radiative fraction in the flaming phase. THIS IS DIFFERENT FROM LOCAL RF IN FDS.
+RF_S = 0.34                 # Radiative fraction in the smouldering phase
+ARRIVAL_TIME_SHIFT = 100    # Starts fire in the simulation earlier
+EMISSIVITY = 0.95           # Emissivity for smoldering surface
+TMPA = 33.0                 # Ambient temperature (Celsius)
 
-###########################################
-# Function to capitalize lines that start with '&'
-def capitalize_ampersand_strings(input_file, output_file):
-    with open(input_file, 'r') as file:
-        lines = file.readlines()
+HOC_GRASS = 18140.0         # kJ/kg
+HOC_CARBON = 30500.0        # kJ/kg
+
+ROTATION_ANGLE_DEG = 20.0   # Rotates the fire map from UTM north to align the domain's Y-axis with the main wind direction
+DOMAIN_BUFFER_M = 50.0      # Buffer in meters for boundaries in x and y directions
+DOMAIN_Z_MAX = 80.0         # Target total height
+DOMAIN_Z_LOWER = 3.0        # Height of the high-resolution lower mesh
+
+TOTAL_MPI_CORES = 72        # Total available CPU cores for calculation
+
+BASE_DIR = Path(__file__).resolve().parent
+INPUT_DIR = BASE_DIR
+OUTPUT_DIR = BASE_DIR / 'output'
+
+warnings.filterwarnings('ignore', r'All-NaN.*') # Suppress NumPy NaN warnings (NaN pixels are expected)
+
+# ================= HELPER FUNCTIONS =================
+def downsample_structured(src, target_res):
+    fields = {'grid_e': 'min', 'grid_n': 'min', 'plotMask': 'max', 'fre_f': 'sum', 
+              'fre_s': 'sum', 'arrivalTime': 'min', 'residenceTime': 'max', 
+              'burningTime': 'max', 'moisture': 'conservative'}
+    out = np.zeros(target_res, dtype=src.dtype)
+    for name, method in fields.items():
+        out[name] = downgradeReso.downgrade_resolution_4nadir(src[name], target_res, method)
+    return out
+
+def active_mask(data):
+    return (data['fre_f'] + data['fre_s'] > 0) & (~np.isnan(data['arrivalTime']))
+
+def apply_domain_cropping(subset, dx, dy):
+    """Crops the domain to the active fire area plus a uniform buffer in x and y directions"""
+    i, j = np.where(active_mask(subset))
+    if not i.size: return subset
+
+    bi, bj = int(np.ceil(DOMAIN_BUFFER_M / dx)), int(np.ceil(DOMAIN_BUFFER_M / dy))
+    h, w = subset.shape
     
-    with open(output_file, 'w') as file:
-        for line in lines:
-            words = line.split()
-            updated_words = [word.upper() if word.startswith('&') else word for word in words]
-            file.write(" ".join(updated_words) + "\n")
-
-###########################################
-def sum_HRR_per_pixel(burner):
-    act_pixels = np.where((burner.fre_f > 0) | (burner.fre_s > 0))
+    subset = subset[max(0, i.min() - bi) : min(h, i.max() + bi + 1), 
+                    max(0, j.min() - bj) : min(w, j.max() + bj + 1)]
     
-    hrr_act_pix = []
-    total_HRR = 0
+    subset['grid_e'] -= np.nanmin(subset['grid_e'])
+    subset['grid_n'] -= np.nanmin(subset['grid_n'])
     
-    for i, j in zip(*act_pixels):
-        hrr_value = float((burner.fre_f[i, j] + burner.fre_s[i, j])*1.e3)
-        burner_id = f"Burner_{i}_{j}"
-        hrr_act_pix.append((burner_id, hrr_value))
-        total_HRR += hrr_value
+    return subset
 
-    return hrr_act_pix, total_HRR
+def get_2tier_geometry(lx, ly, cores):
+    """Generates a compact 2-tier Z-mesh (Lower: 0.5m res, Upper: 1m res) using MULT."""
+    n = cores // 2  
+    nx, ny = min(((i, n//i) for i in range(1, n+1) if n % i == 0), key=lambda x: abs(x[0]-x[1]))
 
-###########################################
-def color_burner(f):
-    if f > 300: 
-        return 'RED'
-    elif f > 150: 
-        return 'ORANGE'
-    elif f > 75: 
-        return 'YELLOW'
-    elif f > 40: 
-        return 'GREEN'
-    else:
-        return 'BLUE'
+    bx, by = int(np.ceil(lx / nx)), int(np.ceil(ly / ny))
+
+    z_cells_lower = int(DOMAIN_Z_LOWER / 0.5)
+    z_cells_upper = int((DOMAIN_Z_MAX - DOMAIN_Z_LOWER) / 1.0)
+
+    meshes = [
+        {'ijk': [bx*2, by*2, z_cells_lower], 'xb': [0., float(bx), 0., float(by), 0., DOMAIN_Z_LOWER], 'mult_id': 'grid'},
+        {'ijk': [bx, by, z_cells_upper], 'xb': [0., float(bx), 0., float(by), DOMAIN_Z_LOWER, DOMAIN_Z_MAX], 'mult_id': 'grid'}
+    ]
+    mult = {'id': 'grid', 'dx': float(bx), 'dy': float(by), 'dz': 0., 'i_upper': nx-1, 'j_upper': ny-1, 'k_upper': 0}
+
+    return (bx * nx, by * ny), (nx, ny, 2), meshes, mult
+
+# ================= PIXEL PROCESSING =================
+def process_pixel(i, j, cell, template, params):
+    ramp_up, ramp_down, rf_f, rf_s, shift, dx, dy, eps, tmpa = params
+    aT, rT, bT = cell['arrivalTime'], cell['residenceTime'], cell['burningTime']
     
-###########################################
-def process_pixel(args):
-    #for i,j in zip(*act_pixels):
+    if np.isnan(aT) or aT < 0: return None
+    aT -= shift
+    area = dx * dy
     
-    i, j, subset, template, w, v = args
+    hrrpua_f = round(cell['fre_f'] / rf_f * 1e3 / (rT * area), 10) if rT > 0 else 0.0
+    hrrpua_s     = round(cell['fre_s'] / rf_s * 1e3 / ((bT - rT) * area), 10) if bT > rT else 0.0  # total HRRPUA: drives mf_s 
+    hrrpua_s_rad = round(cell['fre_s']        * 1e3 / ((bT - rT) * area), 10) if bT > rT else 0.0  # radiative HRRPUA: drives T_s 
+    mf_s = hrrpua_s / HOC_CARBON if hrrpua_s > 0 else 0.0
+    mf_f = round(hrrpua_f / HOC_GRASS, 6) if hrrpua_f > 0 else 0.0
 
-    if subset[i, j]['arrivalTime'] < 0: return None, None, None 
-
-    arrivalT = subset[i, j]['arrivalTime']-arrivalTime_shift
-    residenceT = subset[i, j]['residenceTime']
-    burningT = subset[i, j]['burningTime']
-    fre_f = subset[i, j]['fre_f']
-    fre_s = subset[i, j]['fre_s']
-    grid_e = subset[i, j]['grid_e']
-    grid_n = subset[i, j]['grid_n']
-
-    dx = subset[i+1, j]['grid_e'] - subset[i, j]['grid_e']
-    dy = subset[i, j+1]['grid_n'] - subset[i, j]['grid_n']
-
-
-    if residenceT == 0:
-        HRRPUA_f = 0
-
-    else:
-        HRRPUA_f = round(fre_f/Rf_f * 1.e3 / (residenceT * dx * dy), 10)
-
-    if abs(HRRPUA_f) < 1e-10:  
-        HRRPUA_f = 0
-
-    if (burningT - residenceT) <= 0:  
-        HRRPUA_s = 0
-    else:
-        HRRPUA_s = round(fre_s/Rf_s * 1.e3 / ((burningT - residenceT) * dx * dy), 10)
-
-    if abs(HRRPUA_s) < 1e-10:  # Evitar valores negativos cercanos a cero
-        HRRPUA_s = 0
-        
-    surf_id = f'BURNER_{i}_{j}'
-    ramp_id = f'ramp__{i}_{j}'
+    t_surf = round(((hrrpua_s_rad * 1000.0) / (eps * 5.67e-8) + (tmpa + 273.15)**4)**0.25 - 273.15, 1) if hrrpua_s_rad > 0 else tmpa
     
-    template_here = template.copy()
+    if hrrpua_f < 1e-10 and mf_s < 1e-10: return None
     
-    if HRRPUA_f!=0:
+    surf, _, vent = copy.deepcopy(template)
+    bid = f'{i}_{j}'
 
-        template_here.surf_template['hrrpua'] = HRRPUA_f  
-        template_here.surf_template['id'] = surf_id
-        template_here.surf_template['ramp_q'] = ramp_id
-        
-        template_here.surf_template['color'] = color_burner(HRRPUA_f)  
+    for key in ('COLOR', 'color', 'SPEC_ID', 'spec_id', 'HRRPUA', 'hrrpua',
+                'RAMP_Q', 'ramp_q', 'MASS_FLUX', 'mass_flux',
+                'RAMP_MF', 'ramp_mf', 'TMP_FRONT', 'tmp_front',
+                'EMISSIVITY', 'emissivity', 'RAMP_T', 'ramp_t'): surf.pop(key, None)
 
-        ramp_f_f = HRRPUA_f / HRRPUA_f if HRRPUA_f != 0 else 0
-        ramp_s_f = HRRPUA_s / HRRPUA_f if HRRPUA_f != 0 else 0
-  
-    else:
-        
-        template_here.surf_template['hrrpua'] = HRRPUA_s
-        template_here.surf_template['id'] = surf_id
-        template_here.surf_template['ramp_q'] = ramp_id
-        
-        template_here.surf_template['color'] = color_burner(HRRPUA_f)  
+    surf.update({'ID': f'BURNER_{bid}'})
+    spec_idx = 1
+    if mf_f > 0:
+        surf.update({f'SPEC_ID({spec_idx})': 'GRASS_FUEL', f'MASS_FLUX({spec_idx})': mf_f, f'RAMP_MF({spec_idx})': f'rmf_f_{bid}'})
+        spec_idx += 1
+    if mf_s > 0:
+        surf.update({f'SPEC_ID({spec_idx})': 'C_GAS', f'MASS_FLUX({spec_idx})': round(mf_s, 6), f'RAMP_MF({spec_idx})': f'rmf_s_{bid}',
+                     'TMP_FRONT': t_surf, 'EMISSIVITY': eps, 'RAMP_T': f'rt_{bid}'})
 
-        ramp_f_f = 0
-        ramp_s_f = 1 
+    t = [round(x, 2) for x in [0.0, aT - ramp_up, aT, aT + rT, aT + rT + ramp_down, aT + bT, aT + bT + ramp_down]]
+    for k in range(1, 7): t[k] = round(max(t[k-1] + 0.01, t[k]), 2)
 
-
-    #if ramp_id == 'ramp__26_49': 
-    #    pdb.set_trace()
-
-    for k in range(7):
-        template_here.ramp_template[k]['id'] = ramp_id
-        
-    if ramp_s_f > ramp_f_f: print (ramp_id+': higher smoldering')
-    template_here.ramp_template[1]['t'] = arrivalT - w
+    ramps = []
+    if mf_f > 0:
+        ramps.extend([{'ID': f'rmf_f_{bid}', 'T': x, 'F': y} for x, y in zip(t[1:5], [0.0, 1.0, 1.0, 0.0])])
+    if mf_s > 0:
+        t_s = t[3:]
+        ramps.extend([{'ID': f'rt_{bid}',    'T': x, 'F': y} for x, y in zip(t_s, [0.0, 1.0, 1.0, 0.0])])
+        ramps.extend([{'ID': f'rmf_s_{bid}', 'T': x, 'F': y} for x, y in zip(t_s, [0.0, 1.0, 1.0, 0.0])])
     
-    template_here.ramp_template[2]['t'] = arrivalT
-    template_here.ramp_template[2]['f'] = ramp_f_f
+    ge, gn = cell['grid_e'], cell['grid_n']
+    vent.update({'SURF_ID': surf['ID'], 'XB': [round(x, 3) for x in [ge, ge + dx, gn, gn + dy, 0.0, 0.0]]})
     
-    template_here.ramp_template[3]['t'] = arrivalT + residenceT if residenceT>0 else arrivalT + residenceT + v/2
-    template_here.ramp_template[3]['f'] = ramp_f_f
+    return (surf, ramps, vent)
+
+# ================= DATA EXPORT =================
+def format_fds_block(block_type, params):
+    def fmt_elem(k, x):
+        if isinstance(x, bool): return '.TRUE.' if x else '.FALSE.'
+        if isinstance(x, float):
+            return '0.0' if np.isnan(x) else str(round(x, 6 if 'MASS_FLUX' in k.upper() else 4))
+        if isinstance(x, str): return x if x.startswith('.') else f"'{x}'"
+        return str(x)
+
+    def fmt(k, v):
+        if isinstance(v, (list, tuple, np.ndarray)):
+            return ", ".join(fmt_elem(k, x) for x in v)
+        return fmt_elem(k, v)
+
+    lines = [f" {k.upper()} = {fmt(k, v)}" for k, v in params.items()]
+    return "\n".join([f"&{block_type.upper()}"] + lines + ["/\n"])
+
+def write_fds(nml, results, fds_outfile, domain_sz):
+    for key in ('TAIL', 'tail'): nml.pop(key, None)
+
+    header = f"! Generated computationally with cam2fds in Python (https://github.com/3dfirelab/Burner_Cam2FDS)\n" \
+             f"! Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n" \
+             f"! Domain: {domain_sz[0]:.1f} m (X) x {domain_sz[1]:.1f} m (Y) x {domain_sz[2]:.1f} m (Z)\n\n"
+
+    preferred_order = ['head', 'time', 'mesh', 'mult', 'dump', 'misc', 'reac', 'spec', 'surf',
+                       'vent', 'wind', 'devc', 'slcf', 'bndf']
+    nml_keys = sorted(nml.keys(), key=lambda k: preferred_order.index(k.lower()) if k.lower() in preferred_order else 99)
+
+    with open(fds_outfile, 'w') as f:
+        f.write(header)
+
+        for grp_name in nml_keys:
+            blocks = nml[grp_name]
+            if not isinstance(blocks, list): blocks = [blocks]
+            for block in blocks:
+                if block: f.write(format_fds_block(grp_name, block))
+
+        for surf, ramps, vent in (r for r in results if r):
+            f.write(format_fds_block('SURF', surf))
+            f.write("".join(format_fds_block('RAMP', r) for r in ramps))
+            f.write(format_fds_block('VENT', vent))
+
+        f.write("&TAIL /\n")
+
+
+def to_dict(txt, tag):
+    """Parses a single FDS namelist block string into a plain dict."""
+    if not txt: return {}
+    v = f90nml.reads(txt).get(tag.lower(), {})
+    return copy.deepcopy(v[0] if isinstance(v, list) else v)
+
+# ================= MAIN PIPELINE =================
+def main():
+    print(f"--- Generating FDS case '{CASE_NAME}' ---", flush=True)
+    maps_fire = np.load(INPUT_DIR / INPUT_NPY)
     
-    template_here.ramp_template[4]['t'] = arrivalT + residenceT + v
-    template_here.ramp_template[4]['f'] = ramp_s_f
+    target_res = (maps_fire.shape[0] // TARGET_SCALE, maps_fire.shape[1] // TARGET_SCALE)
+    subset = downsample_structured(maps_fire, target_res)
     
-    template_here.ramp_template[5]['t'] = arrivalT + burningT if burningT>residenceT else arrivalT + residenceT + 2*v
-    template_here.ramp_template[5]['f'] = ramp_s_f
+    subset['grid_e'] -= np.nanmin(subset['grid_e'])
+    subset['grid_n'] -= np.nanmin(subset['grid_n'])
+    dx, dy = float(np.nanmedian(np.diff(subset['grid_e'], axis=0))), float(np.nanmedian(np.diff(subset['grid_n'], axis=1)))
+
+    subset = geometry_utils.resample_rotated_grid(subset, dx, dy, ROTATION_ANGLE_DEG)
+    subset = apply_domain_cropping(subset, dx, dy)
+
+    with open(INPUT_DIR / TEMPLATE_FDS, 'r') as f: raw_txt = f.read()
+    def extract_template_block(tag):
+        m = re.search(rf'(?i)&{tag}[\s\S]*?BURNER_template[\s\S]*?/', raw_txt)
+        return m.group(0) if m else ""
+    surf_txt, vent_txt = extract_template_block('SURF'), extract_template_block('VENT')
     
-    template_here.ramp_template[6]['t'] = arrivalT + burningT + v if burningT>residenceT else arrivalT + residenceT + 3*v
+    nml = f90nml.reads(raw_txt.replace(surf_txt, '').replace(vent_txt, ''))
+    if 'head' in nml: nml['head'].update({'chid': CASE_NAME, 'title': CASE_NAME})
 
-    time_ = [template_here.ramp_template[ii]['t'] for ii in range(1,7)]
-    if np.diff(np.array(time_)).min()<0: pdb.set_trace()
-
-    template_here.vent_template['xb'] = np.round(np.array([grid_e, grid_e+dx, grid_n, grid_n+dy, 0.0, 0.0]), 3)
-    template_here.vent_template['surf_id'] = surf_id
-    print (i,j)
+    lx, ly = subset.shape[0] * dx, subset.shape[1] * dy
+    for k in ('mesh', 'MESH', 'mult', 'MULT'): nml.pop(k, None)
+    (fds_xmax, fds_ymax), _, nml['mesh'], nml['mult'] = get_2tier_geometry(lx, ly, TOTAL_MPI_CORES)
     
+    def update_nml_group(name, func):
+        if name in nml:
+            for item in (nml[name] if isinstance(nml[name], list) else [nml[name]]): func(item)
 
-    return template_here, template_here.ramp_template[1]['t'], template_here.ramp_template[6]['t']
+    update_nml_group('slcf', lambda s: s.update({'xb': [0.0, float(fds_xmax), 0.0, float(fds_ymax), 0.0, DOMAIN_Z_MAX]}))
 
+    vent_xb_map = {
+        '[XMAX]': [fds_xmax, fds_xmax, 0.0, fds_ymax, 0.0, DOMAIN_Z_MAX],
+        '[XMIN]': [0.0, 0.0, 0.0, fds_ymax, 0.0, DOMAIN_Z_MAX],
+        '[YMAX]': [0.0, fds_xmax, fds_ymax, fds_ymax, 0.0, DOMAIN_Z_MAX],
+        '[YMIN]': [0.0, fds_xmax, 0.0, 0.0, 0.0, DOMAIN_Z_MAX],
+        '[ZMAX]': [0.0, fds_xmax, 0.0, fds_ymax, DOMAIN_Z_MAX, DOMAIN_Z_MAX]
+    }
+    update_nml_group('vent', lambda v: v.update({'xb': vent_xb_map[str(v.get('id', '')).upper()]}) if str(v.get('id', '')).upper() in vent_xb_map else None)
 
-###########################################
-if __name__ == '__main__':
-###########################################
+    domain_sz = (fds_xmax, fds_ymax, DOMAIN_Z_MAX)
 
-    # Duration change between fires
-    w = .5
-    v = .1
-    Rf_f = .10 #Radioactive fraction of flaming
-    Rf_s = .3  #Radioactive fraction of smoldering
-    l = 1
+    template = (to_dict(surf_txt, 'SURF'), {}, to_dict(vent_txt, 'VENT'))
+
+    ntasks = int(os.getenv('SLURM_NTASKS', 1))
+    params = (RAMP_UP, RAMP_DOWN, RF_F, RF_S, ARRIVAL_TIME_SHIFT, dx, dy, EMISSIVITY, TMPA)
+
+    mask_post_crop = active_mask(subset)
+    args = [(i, j, subset[i, j], template, params) for i, j in zip(*np.where(mask_post_crop))]
     
-    knpdir='/mnt/dataEstrella1/2014_SouthAfrica/'
-    maps_fire = np.load(knpdir+'4ForeFire/Skukuza4/skukuza4_4ForeFire.npy')
+    with mp.Pool(ntasks) as pool:
+        results = pool.starmap(process_pixel, args) if ntasks > 1 else [process_pixel(*a) for a in args]
     
-    inputDirSimu = '/data/paugam/FDS/BurnerSku4/'
-    fileConfigIn = inputDirSimu+'input_fixed_burner.fds_original'
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     
-    #divide resolution by 2, dx=2m
-    nn = int(maps_fire.shape[0]/2)
-    maps2 = np.zeros([nn,nn], dtype=maps_fire.dtype)
-    maps2['grid_e'] = downgradeReso.downgrade_resolution_4nadir(maps_fire['grid_e'], 
-                                                               maps2.shape, flag_interpolation='min')
-    maps2['grid_n'] = downgradeReso.downgrade_resolution_4nadir(maps_fire['grid_n'], 
-                                                               maps2.shape, flag_interpolation='min')
-    maps2['plotMask'] = downgradeReso.downgrade_resolution_4nadir(maps_fire['plotMask'], 
-                                                               maps2.shape, flag_interpolation='max')
+    fds_outfile = OUTPUT_DIR / f"{CASE_NAME}.fds"
+    write_fds(nml, results, fds_outfile, domain_sz)
 
-    maps2['fre_f'] = downgradeReso.downgrade_resolution_4nadir(maps_fire['fre_f'], 
-                                                               maps2.shape, flag_interpolation='sum')
-    maps2['fre_s'] = downgradeReso.downgrade_resolution_4nadir(maps_fire['fre_s'], 
-                                                               maps2.shape, flag_interpolation='sum')
-    
-    maps2['arrivalTime'] = downgradeReso.downgrade_resolution_4nadir(maps_fire['arrivalTime'], 
-                                                               maps2.shape, flag_interpolation='min')
-    maps2['residenceTime'] = downgradeReso.downgrade_resolution_4nadir(maps_fire['residenceTime'], 
-                                                               maps2.shape, flag_interpolation='max')
-    maps2['burningTime'] = downgradeReso.downgrade_resolution_4nadir(maps_fire['burningTime'], 
-                                                               maps2.shape, flag_interpolation='max')
-    maps2['moisture'] = downgradeReso.downgrade_resolution_4nadir(maps_fire['moisture'], 
-                                                               maps2.shape, flag_interpolation='conservative')
-
-    arrivalTime_shift=100
-
-    #subset_size = 288
-    #start = (mm.shape[0]-subset_size)//2
-    #end = start + subset_size
-    #subset = mm[start:end, start:end]
-    #np.save("mid_subset.npy", subset)
-    subset = maps2
-    subset_size = subset.shape[0]
-
-
-    nml = f90nml.read(fileConfigIn)
-    surf_templates_original = nml['surf']
-    ramp_templates_original = nml['ramp']
-    vent_templates_original = nml['vent']
-    del nml['TAIL'], surf_templates_original, ramp_templates_original, vent_templates_original
-    
-
-    x = subset['grid_e'][:,0]-subset['grid_e'][0,0]
-    y = subset['grid_n'][0,:]-subset['grid_n'][0,0]
-    grid_n, grid_e = subset['grid_n']-subset['grid_n'][0,0], subset['grid_e']-subset['grid_e'][0,0]
-
-    burner = subset.view(np.recarray)
-    burner.grid_e = grid_e
-    burner.grid_n = grid_n
-
-    template = Burner(nml)
-    act_pixels = np.where( (burner.fre_f +burner.fre_s) > 0 )
-    args = [(i, j, subset, template, w, v) for i, j in zip(*act_pixels)]
-
-    #sys.exit()
-    
-    # Verificar si $SLURM_NTASKS existe
-    if 'SLURM_NTASKS' in os.environ:
-        # Leer el valor y convertirlo a un entero
-        ntasks = int(os.getenv('SLURM_NTASKS'))
-        print(f"SLURM_NTASKS existe y su valor es: {ntasks}")
-    else:
-        # Acción alternativa si no existe
-        ntasks = int(os.getenv('ntask'))
-        print("SLURM_NTASKS no está definido en las variables de entorno.")
-
-
-    # Use multiprocessing to process pixels
-    if False:
-        with mp.Pool(ntasks) as pool:
-            results = pool.map(process_pixel, args)
-    else: 
-        results = []
-        for arg in args: 
-            results.append(process_pixel(arg))
-
-    print (len(results),'burners will be written in fds config file')
-    # Add processed templates to the .fds file
-    minArrivalT = 1.e6
-    maxArrivalT = -1.e6
-    for template_here, mint, maxt in results:
-        if template_here is None: continue
-        
-        minArrivalT = min([minArrivalT,mint])
-        maxArrivalT = max([maxArrivalT,maxt])
-
-        nml.add_cogroup('SURF', template_here.surf_template)
-        [nml.add_cogroup('RAMP', ramp_) for ramp_ in template_here.ramp_template]
-        nml.add_cogroup('VENT', template_here.vent_template)
-
-    print('min max time in burner:')
-    print(minArrivalT)
-    print(maxArrivalT)
-
-    nml['tail'] = {}
-    del nml['SURF'][0]
-    for i in range(7):
-        del nml['RAMP'][0]
-    del nml['VENT'][0]
-
-    f90nml.write(nml, 'tmp.fds')
-    capitalize_ampersand_strings('tmp.fds', inputDirSimu+os.path.basename(fileConfigIn).split('.')[0]+'_withBurner.fds')    
-    os.remove('tmp.fds')
-
-    hrr_act_pix, total_HRR = sum_HRR_per_pixel(burner)
-    print(f"La suma total de HRR es: {total_HRR:.4f} KJ")
+if __name__ == "__main__":
+    main()
 
